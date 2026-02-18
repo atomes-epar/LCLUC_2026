@@ -1,0 +1,175 @@
+---
+title: "Visualizing Land Cover and Land Use Change with NASA Satellite Imagery"
+author: "Justin Fain (NASA | BAERI)"
+date: "2026-02-26"
+output: html_document
+---
+
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(root.dir = '/Users/jjfain/Projects/ARSET/Landcover_Change_Mapping/')
+```
+
+::: {.alert .alert-block .alert-info}
+#### Reminder:
+
+You will have access to the code, data, slides, and training materials via the training page and ARSET GitHub. I highly recommend that you watch my demonstration and then explore the code after the training has concluded.
+:::
+
+# Part 1: Unsupervised Classification
+
+## K-Means Clustering
+
+We will begin by loading all of the libraries we will use in this training, including some that will only become relevant in Part 2. We should also set the random seed so that we always get the same results from random (or pseudo-random) operations.
+
+```{r libs, results='hide', message=FALSE, warning=FALSE}
+library(randomForest)
+library(randomForestExplainer)
+library(tidyverse)
+library(terra)
+library(tidyterra)
+library(patchwork)
+
+set.seed(20260226)
+```
+
+### Loading HLS Data
+
+For the sake of convenience I have gone ahead and combined the HLS data into single multi-band rasters[^1] for each year. This is what you will find on the GitHub as well.
+
+[^1]: HLS data comes with each band in a separate raster file. To combine them you can read each as a SpatRaster and combine them into a single multi-band SpatRaster. My preferred method, however, is to use the "gdal raster stack" utility since that gives you some extra options which may be useful in specific situations. <https://gdal.org/en/stable/programs/gdal_raster_stack.html>
+
+We will now read the imagery data for 2017 and 2024 using the rast function and specify which of the HLS bands correspond to the Red, Green, and Blue wavelengths. In the case of HLS data, those are bands 4, 3, and 2 since band 1 is the Coastal Aerosol band.
+
+```{r rast_data}
+# Read the multiband rasters for 2017 and 2024
+y17 <- rast('data/rast/HLS_2017_multiband.tif') %>%
+  RGB(c(4,3,2)) # Assign the RGB bands per the HLS band numbering system
+y24 <- rast('data/rast/HLS_2024_multiband.tif') %>%
+  RGB(c(4,3,2))
+```
+
+We can create a spatial raster collection to store both the 2017 and 2024 imagery data in the same object.
+
+```{r rast_collection}
+# Create a spatial raster collection containing the rasters for both years
+hls <- sprc(y17, y24)
+```
+
+Let's quickly inspect the spatial raster collection to see the structure of our data.
+
+```{r view_sprc_obj}
+# Check the sprc we just made
+hls
+```
+
+The important things to notice are:
+
+-   The collection has a length of 2, corresponding to our two years of data
+
+-   Both years have the same number of rows and columns
+
+-   Both years have the same number of layers or bands
+
+We can create RGB maps of the data for both years and plot them side-by-side using the {patchwork} syntax.
+
+```{r plot_rasters, results='hide', message=FALSE}
+# Create plots for each element of the sprc
+p17 <- ggplot() +
+  geom_spatraster_rgb(data = hls[1], stretch = 'hist') +
+  ggtitle('2017') +
+  theme_void()
+
+p24 <- ggplot() +
+  geom_spatraster_rgb(data = hls[2], stretch = 'hist') +
+  ggtitle('2024') +
+  theme_void()
+```
+
+```{r plot_years_layout}
+
+p17 | p24 # This is {patchwork} syntax for side-by-side layouts
+```
+
+::: {.alert .alert-block .alert-info}
+Note: These images may look strange because I have applied a histogram stretch to each raster for increased contrast in plotting. This doesn't affect the underlying data values.
+:::
+
+### Applying K-means
+
+It is very simple to implement k-means clustering to our HLS data. Since we don't need to provide any training data for this unsupervised classification method simply need to specify the number of centers. I'll demonstrate this with the imagery from 2017 for 2, 3, 4, and 5 centers. These each take about a minute to finish running, so to avoid waiting I have already processed them and saved the results.
+
+```{r kmeans_for_multiple_k}
+# K-means clustering will attempt to make any arbitrary number of class splits
+km2 <- k_means(hls[1], centers = 2)
+km3 <- k_means(hls[1], centers = 3)
+km4 <- k_means(hls[1], centers = 4)
+km5 <- k_means(hls[1], centers = 5)
+```
+
+Notice that the results of applying k-means clustering to the 2017 data isn't automatically shown as an image, but the result is a SpatRaster which we can use to generate an image. Calling the resulting object directly gives us some additional information as well.
+
+```{r view_km_obj}
+km5
+```
+
+We see here that the output has the same dimensions and projection information as the input, but now reduced to only one layer which, in the case of the k-means with 5 centers, has values ranging between 1 and 5.
+
+### Visualizing Clustering Results
+
+To save some typing and make sure our plots are consistent I'm going to write a plotting helper function. We should also associate our numeric class labels with names so that we can more easily apply a categorical color palette. We are working with classes, so the integer class values are meant to represent discrete clusters. Naming them A-Z means that we can avoid R trying to interpret our classes as numeric values.
+
+```{r plotting_helper}
+# We only need 5 categories, but it is just as easy to make 26 using the R builtin LETTERS
+value_categories <- data.frame(value=1:26, class=LETTERS)
+
+# This plotting function applies our value categories and make a plot from our SpatRaster
+# with a standard fill aesthetic and "void" theme which removes unnecessary plot elements
+classified_raster_plot <- function(kmeans_raster) {
+  # Assign the alphabetic categories to our (integer) numeric k-means output
+  kmd <- categories(kmeans_raster, value=value_categories) # "kmd" for k-means discrete
+  
+  # k_val <- minmax(kmeans_raster)[2] # Optionally extract the value of K
+  
+  ggplot() +
+    geom_spatraster(data = kmd) +
+    scale_fill_princess_d(name='Class') +
+    # ggtitle(paste0("K=", k_val)) + # This adds information about the value of K to each plot
+    theme_void()
+}
+```
+
+#### K-means Clustering Plots
+
+We can now create the maps for each of our K-means classification runs using our plotting helper function. Once again, we will save these plots as objects so we can put them together with the patchwork syntax.
+
+```{r km_plots_gen, message=FALSE}
+# Save plots for each of our k-means clustering runs
+plot_km2 <- classified_raster_plot(km2)
+plot_km3 <- classified_raster_plot(km3)
+plot_km4 <- classified_raster_plot(km4)
+plot_km5 <- classified_raster_plot(km5)
+```
+
+We can put things together using the patchwork syntax, which is a simple layout tool for multiple plot objects.[^2] What we see below is the same array of k-means maps I showed at the beginning of this training.
+
+[^2]: <https://patchwork.data-imaginist.com/>
+
+```{r km_plots_layout}
+# Assemble the plots with patchwork, including the original plot
+p17 + (plot_km2 | plot_km3) / (plot_km4 | plot_km5)
+```
+
+### Notes on K-means Classification
+
+Since the clusters are based on the similarity of reflectance characteristics we can see that even in the case of k=2 we are getting good detection of water (Class A) with everything that is not-water being sorted into Class B.[^3] At the opposite end of the spectrum we have the k=5 case where we might observe that water is seemingly being split into separate turbid (Class B) and clear (Class E) categories.
+
+[^3]: Recall that the class which contains "everything else" is sometimes called the null class. In this case we could say that Class A represents water while Class B is the null class since it doesn't represent anything in particular aside from indicating that its members are distinct from water.
+
+As you can see, LC classification by k-means clustering is relatively simple and fast. It doesn't need any training data and only requires us to pick a suitable number of cluster centers. I want to reiterate that we didn't need to provide *any information* about what kinds of land cover appear in our imagery.[^4] Since k-means is so incredibly easy to use it is often a good idea to try a variety of values for k and select the one which best classifies the LC types you are interested in studying.
+
+[^4]: While it may seem that k-means has an uncanny ability to select sensible classes based only on spectral similarity, the corollary is that there is therefore a minimum spectral difference which k-means can resolve as separate classes and that limit is sensitive to the dissimilarity of all other objects in your scene.
+
+### Conclusion
+
+Now that you've learned how to create and visualize a k-means clustering model for LC classification we're going to jump back to the slides and go over what we've learned today, what we're going to going to cover in Part 2, and then jump into the Q&A portion of this training.

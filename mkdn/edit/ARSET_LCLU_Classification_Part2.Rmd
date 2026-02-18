@@ -1,0 +1,425 @@
+---
+title: "Visualizing Land Cover and Land Use Change with NASA Satellite Imagery"
+author: "Justin Fain (NASA | BAERI)"
+date: "2026-02-26"
+output: html_document
+---
+
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(root.dir = '/Users/jjfain/Projects/ARSET/Landcover_Change_Mapping/')
+```
+
+::: {.alert .alert-block .alert-info}
+#### Reminder:
+
+You will have access to the code, data, slides, and training materials via the training page and ARSET GitHub. I highly recommend that you watch my demonstration and then explore the code after the training has concluded. I have pre-computed some results for the sake of time, so if you try to follow along you will certainly fall behind.
+:::
+
+# Part 2: Supervised Classification
+
+## Building a Random Forest Model
+
+Today we will be looking at supervised classification by creating a random forest model from training data.
+
+We will begin by loading all of the libraries we will use in this training. This is the same set we used in the code for Part 1. We should also set the random seed so that we always get the same results from random (or pseudo-random) operations.
+
+```{r library, results='hide', message=FALSE, warning=FALSE}
+library(randomForest)
+library(randomForestExplainer)
+library(tidyverse)
+library(terra)
+library(tidyterra)
+library(patchwork)
+
+set.seed(20260226)
+```
+
+### Load Imagery Data
+
+Just as we did in Part 1, we need to load the raster data for 2017 and 2024. I'm also going to go ahead and make RGB plots for both years so we have them ready if we need to use them as base maps later. I won't go over this since you've seen the process before. You can refer to the comments in the code block for a quick refresher.
+
+```{r, results='hide', message=FALSE}
+# Read the multiband rasters for 2017 and 2024
+y17 <- rast('data/rast/HLS_2017_multiband.tif') %>%
+  RGB(c(4,3,2)) # Assign the RGB bands per the HLS band numbering system
+y24 <- rast('data/rast/HLS_2024_multiband.tif') %>%
+  RGB(c(4,3,2)) # The RGB bands are 4, 3, and 2 since band 1 is Coastal Aerosol
+
+# Create a spatial raster collection containing the rasters for both years
+hls <- sprc(y17, y24)
+
+# Create and store a plot for each 2017 and 2024 
+p17 <- ggplot() +
+  geom_spatraster_rgb(data = hls[1], stretch = 'hist') +
+  ggtitle('2017') +
+  theme_void()
+
+p24 <- ggplot() +
+  geom_spatraster_rgb(data = hls[2], stretch = 'hist') +
+  ggtitle('2024') +
+  theme_void()
+```
+
+### Load Training Data
+
+We can now load the training points I have already prepared for this training. The points are associated with the image from 2017 since we will build our model on the 2017 data before applying it to the 2024 data.
+
+I also apply the `na.omit` function to remove any points that are missing a class label. The training set is small enough we could do a manual check for missing class labels, but this is good practice for cleaning any training data.
+
+```{r}
+tpts <- vect('data/vect/training_points_2017.gpkg') # These are points on the 2017 data
+
+tpts <- na.omit(tpts) # Remove any points without data
+```
+
+#### Visualizing the training data
+
+It is useful to take a look at the training points in the context of the imagery, so let's plot them on top of the RGB plot for 2017 we stored earlier. The points should be colored according to their class so we can confirm they are representing the land cover types we expect. We are using a variant of the Okabe-Ito[^1] colors for the points here and setting the fill aesthetic to match the `lc_class` variable.
+
+[^1]: Okabe, M., & Ito, K. (2008). Color universal design (CUD): How to make figures and presentations that are friendly to colorblind people.
+
+```{r}
+# Set a color ramp
+okabe <- c("#D55E00", "#009E73", "#F5C710", "#56B4E9", "#0072B2", "#E69F00", "#CC79A7")
+
+# Plot the points over the data
+p17 +
+  geom_spatvector(data = tpts,
+                  mapping = aes(fill=lc_class),
+                  size=4,
+                  shape=21,
+                  color='black',
+                  alpha=0.7) +
+  scale_fill_discrete("LC Class", type=okabe) +
+  NULL
+```
+
+### Merging Training Data with Imagery
+
+We have a situation where our training points and the underlying raster are spatially associated, but the training points don't have any information about the reflectance values stored in the raster. We can extract the reflectance values of the raster at each of the training points using the `extract` function with the `bind` option set to `TRUE` so that the results include the reflectance values as well as the landcover class labels. We also need to ensure that the lc_class variable is stored as a factor (the R data type for categorical values) or `randomForest` will assume we are doing regression and throw an error because regression on a character vector is undefined.
+
+```{r}
+tpts_refl <- extract(y17, tpts, bind = TRUE)
+
+tpts_refl$lc_class <- as.factor(tpts_refl$lc_class)
+```
+
+Here's a quick check of our combined training data to make sure everything worked as expected.
+
+```{r}
+head(tpts_refl)
+```
+
+We see that lc_class is listed as `<fctr>` which indicates that it's been converted to the R factor data type. The reflectance values are still listed as `<dbl>` which is the double-precision floating point (numeric) data type. With that sorted we are free to move on.
+
+### Training the Model
+
+There are a few important elements to the `randomForest` function call. We will go ahead and run the function here and then explain what each part is doing.
+
+```{r rf_train}
+rf17 <- randomForest(formula = lc_class ~ .,
+                     data = tpts_refl,
+                     proximity = T,
+                     importance = T,
+                     ntree = 100,
+                     do.trace = F)
+```
+
+The following is a breakdown of the arguments to the `randomForest` function call. Note that these are not all of the possible arguments, just the ones that I think are core to understanding RF and/or simply practical to know:
+
+-   `formula =`
+
+    -   A formula describing the relationship between the objective and predictors
+
+    -   `lc_class ~ .`
+
+        -   The variable `lc_class` is predicted `~` by all of the variables `.` in `data`
+            -   `lc_class` is excluded since it is the target of the prediction
+            -   For classification this takes the form `class ~ predictors`
+                -   The `.` just stands in for "everything else"
+
+-   `data =`
+
+    -   The data from which to draw all class and value information
+
+    -   Must contain labels as factors for classification
+
+-   `proximity = T`
+
+    -   This value is closer to 1 when the pair of observations are more similar[^2]
+
+    -   We will look at how to visualize this in the next part
+
+    -   Set to `F` turn this off
+
+-   `importance = T`
+
+    -   Returns information about how much each of the predictors contributed to the final model
+
+-   `ntree = 100`
+
+    -   Adjust how many random trees to build (defaults to 500)[^3]
+
+        -   We're only using 100
+
+        -   In our very limited example building more trees is unlikely to improve our results[^4]
+
+-   `do.trace = F`
+
+    -   If set to 1 or T/TRUE then returns verbose information for each tree built.
+
+    -   For any n \>1 will give the verbose information for every n trees
+
+[^2]: Really this is the percentage of the random trees where two observations ended up in the same node, so it should be higher for observations that share a class and 1 (100%) along the diagonal
+
+[^3]: I tried this with 500, 200, and 100 trees and there isn't any appreciable gain.
+
+    Our sample is very small relative to the study area and not truly representative. The study area and target classes are also intentionally simplified
+
+[^4]: Suffice to say that increasing ntree (or tweaking other parameters which increase computational complexity) does not always improve the accuracy of results. A parsimonious model is almost always preferable to a more complex one.
+
+    The optimal selection of parameters is both fascinating as an optimization problem and as a philosophical question. Unfortunately neither of those are conversations to be had in this training.
+
+#### Applying the trained RF model
+
+We now have a trained RF model which describes the classification process. To return to the example in the slides, you can think of this as being equivalent to the decision tree with all of the Yes/No questions filled out.
+
+Importantly, the model object is **not** a raster that we can plot. In order to get from the model object to a raster output we have to apply the trained model using the `predict` function. Since the model is already trained we can apply it to both the 2017 and 2024 imagery.
+
+```{r rf_apply, results='hide', message=FALSE, warning=FALSE}
+pred17 <- predict(hls[1], rf17)
+pred24 <- predict(hls[2], rf17)
+```
+
+### Quantifying LC Change with a Change Matrix
+
+Now that we have two maps of land cover change in 2017 and 2024 we can create a change matrix which shows how many pixels of each class in 2017 became pixels of the same or a different class in 2024.
+
+To do this, we will join the single-band rasters for each year into a multi-band raster and use the crosstab function.
+
+I am going to do this two slightly different ways. The first will return a matrix-style table, whereas the second will return the same information in a "long" format which is more conducive to sorting and a bit easier to read.
+
+```{r}
+change_mat <- c(pred17, pred24) %>% 
+  crosstab()
+
+names(dimnames(change_mat)) <- c('class_2017', 'class_2024')
+
+
+change_mat_long <- c(pred17, pred24) %>% 
+  crosstab(long = T) %>% 
+  rename(class_2017 = class,
+         class_2024 = class.1,
+         n = n)
+```
+
+First we will look at the change matrix in the typical form. In this case the rows correspond to the predicted land cover class in 2017 and the columns correspond to the predicted land cover class in 2024.
+
+```{r}
+change_mat
+```
+
+This may look a bit complicated at first, but let's just consider the changes in pixels that were classified as water in 2017.
+
+```         
+            barren  forest     veg   water
+    water  1487464   90246  168009 1202249
+```
+
+Here we see that of the pixels classified as water in 2017:
+
+-   1,487,464 were later classified as barren
+
+-   90,246 were later classified as forest
+
+-   168,009 were later classified as vegetation
+
+-   1,202,249 remained classified as water
+
+Notice that when something is classified as a change from water to water we can say instead that those pixels did not change, and all of these A:A pairs lie along the diagonal.
+
+Since the diagonal of the matrix represents the number of pixels which did not change (e.g. a "change" from barren to barren) and the sum across the rows represents the total number of pixels for that class in 2017, we can very easily calculate the percentage of each class that remained unchanged.
+
+```{r}
+# Divide the unchanged (diagonal) by the 2017 total (row sums)
+diag(change_mat) / rowSums(change_mat)
+```
+
+We see immediately that the barren class changed the least as 92.25% of the pixels classified as barren in 2017 were still classified as barren in 2024. Vegetation saw the most change as only 13.44% of the pixels classified as vegetation in 2017 were still classified as vegetation in 2024.
+
+Referring back to the change matrix we may also notice that the 2017 vegetation pixels most commonly changed to barren in 2024 (793,953 pixels). With only a bit more math we can calculate that 66.35% of the vegetation pixels became barren pixels.
+
+```{r}
+change_mat['veg', 'barren'] / sum(change_mat['veg', ])
+```
+
+Notice that this matrix format gives us a handy `change_mat[ 'from_class', 'to_class' ]` syntax for isolating specific changes between pairs of classes.
+
+The long version I mentioned earlier simply takes all of the information in the change matrix and stretches it out such that each of the possible "from_class" "to_class" pairs are listed individually. This is particularly useful if you want to filter and sort your data to get the magnitude of change.
+
+```{r}
+change_mat_long %>%
+  filter(class_2017 != class_2024) %>% # Filter to remove the diagonal (non-changes)
+  sort('n', -1) # Sort by descending count
+```
+
+You could summarize the data further, such as when you're looking for the total loss/gain of a particular LC class.
+
+```{r}
+veg_gain <- change_mat_long %>% 
+  filter(class_2024 == 'veg' & class_2017 != 'veg') %>% # Is veg now AND wasn't veg before
+  select(n) %>% # select the counts
+  sum() # sum of the counts
+
+veg_loss <- change_mat_long %>% 
+  filter(class_2024 != 'veg' & class_2017 == 'veg') %>% # Isn't veg now AND was veg before
+  select(n) %>% #select the counts
+  sum() # sum of the counts
+
+data.frame(class = 'veg',
+           loss = veg_loss,
+           gain = veg_gain,
+           ratio = veg_loss/veg_gain)
+```
+
+Now we can see that we've isolated the overall changes in vegetation, measured the magnitude of both gain and loss, and determined that the vegetation class only lost 67.1% of the pixels it gained. To put that another way, even though vegetation experienced the greatest change overall, it still had a gain of \~1.5 pixels for each pixel lost. We can therefore say that the vegetation class expanded between 2017 and 2024 overall, but areas which were previously vegetation did not tend to remain vegetation.
+
+The change matrices give us a great quantitative insight into the magnitude and direction of change over time, but it is also important to understand where these changes occur in space. We will return to the slides briefly where I will lay out the process for turning all of this information into a map of LCLUC.
+
+------------------------------------------------------------------------
+
+### Visualizing LCLUC Over Time
+
+Just as we did in Part 1 of this training, I am going to use a plotting helper function so that all of our plots use a consistent layout and legend. This is very similar to the plotting helper function in Part 1 so I won't go over it in detail.
+
+```{r}
+
+rf_predicted_raster_plot <- function(predicted_raster) {
+  
+  valid_lc_classes <- unique(predicted_raster$class)
+
+  ggplot() +
+    geom_spatraster(data = predicted_raster) +
+    scale_fill_discrete(name='Class',
+                        labels = valid_lc_classes,
+                        palette = okabe,
+                        na.value = 'black') +
+    theme_void()
+}
+```
+
+I will now use the plotting helper function to create plots of each of the classified rasters and arrange them side-by-side.
+
+```{r}
+p_pred17 <- rf_predicted_raster_plot(pred17)
+p_pred24 <- rf_predicted_raster_plot(pred24)
+
+(p_pred17 | p_pred24)
+```
+
+In the 2017 image on the left we see the large extent of flooded areas outside the main course of the river which are replaced by the barren class in the 2024 image on the right. We also see some significant expansion of vegetation in parts of the forested area to the south of the river. This is giving us visual clues about the strange metrics regarding vegetation we were seeing in the change matrix. Although very few pixels which were vegetation in 2017 remain vegetation in 2024, the expansion of vegetation in the forested areas explains why there was still an overall gain in the vegetation class.
+
+#### Creating a binary change mask
+
+In the slides I mentioned that all we need to do in order to create a binary change mask is to use the `!=` logical inequality operator. Let's do that now and then plot the results.
+
+```{r}
+change_mask <- pred17 != pred24 # Is the pixel different between 2017 and 2024?
+
+ggplot() +
+  geom_spatraster(data=change_mask) +
+  scale_fill_discrete("LC Changed", # Name the legend labels
+                      palette = c('grey20', 'grey90'), # False is dark, True is light
+                      na.translate = F) + # There are no NA values, so remove it from the legend
+  theme_void() # Remove axis ticks
+```
+
+There we have the binary change mask exactly as I demonstrated in the slides with the small model. Following exactly the same procedures, we might be interested in applying this mask back to one or both of the previous classified LC maps, which is as simple as multiplying the original map with this new change mask. However, the terra package gives us a much cleaner way of achieving the same result using the mask function and specifying that we want our mask value to be 0 (False).
+
+```{r}
+pred17_change <- mask(pred17, change_mask, maskvalues = 0)
+pred24_change <- mask(pred24, change_mask, maskvalues = 0)
+```
+
+Now we can plot both maps using the same helper function we used earlier.
+
+```{r}
+p_pred17_chg <- rf_predicted_raster_plot(pred17_change)
+p_pred24_chg <- rf_predicted_raster_plot(pred24_change)
+
+p_pred17_chg | p_pred24_chg
+```
+
+By only highlighting the pixels that experienced change between 2017 and 2024, we can get a better idea of the locations where certain changes took place. If we think of these maps in terms of the change matrix, we have essentially visualized everything except for the diagonal of the matrix, which is now NA. We can now see in stark contrast the loss of forest to vegetation and the loss of water to barren as well as where in the scene these changes are occurring. That map on the right is the same one I had promised to show you how to make at the beginning of this presentation.
+
+So, for one final time, we're going to return to the slides for a summary and conclusion, and then we will open up the Q&A session.
+
+------------------------------------------------------------------------
+
+# Additional Information
+
+::: {.alert .alert-block .alert-info}
+Note: The following section gives some extra information and examples to aid in your understanding of RF models but in not covered as part of the training.
+:::
+
+### Assessing model performance
+
+There are a few existing methods for looking at some of the model performance metrics such as the `print` and `importance` methods for random forest model objects and the variable importance plot `varImpPlot`. This is what those look like:
+
+```{r}
+print(rf17)
+importance(rf17)
+varImpPlot(rf17)
+```
+
+However, there are far more powerful evaluation metrics that don't require much extra work.
+
+### Explaining the model
+
+The package `{randomForestExplainer}`, which is already installed in this document, provides a wide array of functions to help you understand the characteristics of your RF models. There is even a function called `explain_forest` which wraps all of these results into a nice html report. Below I have given just one example of a particularly useful plot from the package which shows the importance of each variable (band) in the tree.
+
+```{r}
+rf17 %>%
+  measure_importance() %>%
+  plot_multi_way_importance()
+```
+
+### Similarity as a metric of training data quality
+
+Our ability to apply a single model to two different scenes requires us to operate under the assumption that the reflectance characteristics of each LC class remain constant over time. This is not strictly true in the real world. For example, we know that the leaves of trees change appearance as a response to things like soil moisture and seasonality. The model is robust to these differences only if the training data captures the variability of real-world conditions.
+
+Ideally, training data with the same class label would have a wide range of correlation values on the high end (roughly 75% or greater) *without* any observation being more closely correlated to training data observations of a different class. That is to say that we would prefer to maximize the variability within a class while minimizing the similarity between classes.
+
+We can visualize the pairwise similarity for our training data using the proximity matrix from our RF model object. That lets us get a quick sense for which of our training data points might be too confusing (cross-class correlation) or classes with too little variability (all observations within the class have similarity \~1).
+
+```{r}
+rf17_long <- as.data.frame(rf17$proximity) %>% # Coerce the proximity matrix into a df object
+  rownames_to_column(var = "yax") %>% # the row names (obs numbers) become a named column
+  pivot_longer( # coerce the data into a long format where each obs is a single row
+    cols = -yax, # ignore the observation number in reshaping
+    names_to = "xax", # names become x-axis labels
+    values_to = "corr") %>% # remaining values are called "corr" for correlation
+  mutate(
+    xvar=factor(xax, levels = 1:32), # Use 32 levels since there are 31 points
+    yvar=factor(yax, levels = 1:32)  # The extra level is dropped silently
+    )
+
+ggplot(rf17_long, mapping = aes(x = xvar, y = yvar, fill = corr)) +
+  geom_tile() + # Display as heat map matrix (tile geometry)
+  scale_fill_grass_c() + # Use the GRASS-style viridis color table
+  labs(x = "Training Class",
+       y = "Training Class",
+       fill = "Similarity") + # Add labels and guide
+  coord_equal() + # Force square matrix layout
+  scale_y_discrete(labels = tpts$lc_class) + # label each tpts obs by class
+  scale_x_discrete(labels = tpts$lc_class) + # ditto
+  theme(
+    axis.text.x = element_text( # Rotate and align the x-axis labels
+    angle = 90,
+    vjust = 0.5,
+    hjust=1)
+    )
+```
+
+### 

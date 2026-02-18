@@ -1,0 +1,2 @@
+data/rast/HLS_2017_multiband.tif filter=lfs diff=lfs merge=lfs -text
+data/rast/HLS_2024_multiband.tif filter=lfs diff=lfs merge=lfs -text
